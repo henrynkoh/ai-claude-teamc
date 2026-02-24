@@ -5,31 +5,30 @@ import { Ticket, DashboardStats } from '@/lib/types';
 import DashboardHeader from '@/components/DashboardHeader';
 import KanbanBoard from '@/components/KanbanBoard';
 import CreateTicketModal from '@/components/CreateTicketModal';
-import { Terminal, Zap } from 'lucide-react';
+import { Terminal, Zap, AlertTriangle } from 'lucide-react';
+
+const EMPTY_STATS: DashboardStats = {
+  total: 0, todo: 0, in_progress: 0, done: 0, lastUpdated: '', agents: [],
+};
 
 export default function Home() {
   const [tickets, setTickets] = useState<Ticket[]>([]);
-  const [stats, setStats] = useState<DashboardStats>({
-    total: 0,
-    todo: 0,
-    in_progress: 0,
-    done: 0,
-    lastUpdated: '',
-    agents: [],
-  });
+  const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS);
   const [showCreate, setShowCreate] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
+  const [storageError, setStorageError] = useState(false);
 
   const fetchDashboard = useCallback(async (showSpinner = false) => {
     if (showSpinner) setRefreshing(true);
     try {
       const res = await fetch('/api/dashboard');
       const data = await res.json();
-      setTickets(data.tickets ?? []);
-      setStats(data.stats ?? {});
+      setTickets(Array.isArray(data.tickets) ? data.tickets : []);
+      setStats(data.stats ?? EMPTY_STATS);
+      setStorageError(!!data._storageError);
     } catch {
-      // silent
+      // silent — keep existing state
     } finally {
       if (showSpinner) setRefreshing(false);
       setInitialLoad(false);
@@ -63,6 +62,19 @@ export default function Home() {
         refreshing={refreshing}
       />
 
+      {/* Redis setup banner */}
+      {storageError && (
+        <div className="mx-6 mt-3 flex items-start gap-3 bg-amber-950 border border-amber-700 rounded-xl px-4 py-3 shrink-0">
+          <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+          <div className="text-xs text-amber-300 leading-relaxed">
+            <span className="font-semibold">Redis not connected.</span>{' '}
+            Go to{' '}
+            <span className="font-mono text-amber-200">vercel.com → taskforce-ai → Storage</span>
+            {' '}→ Add Upstash Redis → Link to this project. Vercel will redeploy automatically.
+          </div>
+        </div>
+      )}
+
       {tickets.length === 0 ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 px-6">
           <div className="flex flex-col items-center gap-4 max-w-md text-center">
@@ -82,12 +94,14 @@ export default function Home() {
                 {`Initialize TaskForce Kanban board and create tickets for: [your project goal]. Then have agents claim and work on them.`}
               </code>
             </div>
-            <button
-              onClick={() => setShowCreate(true)}
-              className="px-6 py-2.5 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-sm font-medium transition-colors"
-            >
-              Create first ticket
-            </button>
+            {!storageError && (
+              <button
+                onClick={() => setShowCreate(true)}
+                className="px-6 py-2.5 bg-violet-600 hover:bg-violet-500 text-white rounded-xl text-sm font-medium transition-colors"
+              >
+                Create first ticket
+              </button>
+            )}
           </div>
         </div>
       ) : (
@@ -98,7 +112,7 @@ export default function Home() {
         />
       )}
 
-      {tickets.length > 0 && (
+      {tickets.length > 0 && !storageError && (
         <button
           onClick={() => setShowCreate(true)}
           className="fixed bottom-6 right-6 w-12 h-12 bg-violet-600 hover:bg-violet-500 text-white rounded-full shadow-lg shadow-violet-900/50 flex items-center justify-center transition-all hover:scale-110"

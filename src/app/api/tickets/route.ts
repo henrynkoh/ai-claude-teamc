@@ -4,7 +4,7 @@ import { CreateTicketPayload } from '@/lib/types';
 
 export async function GET() {
   try {
-    const tickets = getAllTickets();
+    const tickets = await getAllTickets();
     return NextResponse.json({ tickets });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
@@ -17,7 +17,7 @@ export async function POST(req: NextRequest) {
     if (!body.title) {
       return NextResponse.json({ error: 'title is required' }, { status: 400 });
     }
-    const ticket = createTicket({
+    const ticket = await createTicket({
       title: body.title,
       description: body.description ?? '',
       priority: body.priority ?? 'medium',

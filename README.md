@@ -1,36 +1,142 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# TaskForce.AI
 
-## Getting Started
+> Persistent Kanban PM dashboard for Claude Agent Teams
+> Inspired by the "데이터가 답이다" YouTube channel (Feb 2026)
 
-First, run the development server:
+## What is this?
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+A Next.js web app that replaces volatile terminal logs with a structured, file-based Kanban board for managing multiple Claude agents working in parallel.
+
+```
+Agent Terminal                    TaskForce.AI Dashboard (localhost:3000)
+─────────────────                 ──────────────────────────────────────
+backend-agent: working...    →    [ticket-001] Build API  → backend-agent  [In Progress]
+frontend-agent: styling...   →    [ticket-002] Style UI   → frontend-agent [In Progress]
+test-agent: writing tests... →    [ticket-003] Write Tests → test-agent    [In Progress]
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Quick Start
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm install
+npm run dev
+# Open http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Architecture
 
-## Learn More
+```
+taskforce-ai/
+├── src/
+│   ├── app/
+│   │   ├── page.tsx              # Kanban board UI (auto-refreshes every 5s)
+│   │   └── api/
+│   │       ├── tickets/          # CRUD for tickets
+│   │       │   └── [id]/log/     # Activity log per ticket
+│   │       └── dashboard/        # Stats + all tickets
+│   ├── components/
+│   │   ├── KanbanBoard.tsx       # Drag-and-drop Kanban
+│   │   ├── TicketCard.tsx        # Ticket card
+│   │   ├── TicketModal.tsx       # Detail view + log viewer
+│   │   ├── CreateTicketModal.tsx # Create ticket form
+│   │   └── DashboardHeader.tsx   # Stats bar
+│   └── lib/
+│       ├── types.ts              # TypeScript types
+│       └── tickets.ts            # File system operations
+├── taskforce_kanban/             # Persisted on disk (git-tracked)
+│   ├── todo/                     # Pending ticket JSON files
+│   ├── in_progress/              # Active ticket JSON files
+│   ├── done/                     # Completed ticket JSON files
+│   ├── logs/                     # Per-ticket activity logs (markdown)
+│   └── taskforce_dashboard.md    # Human-readable dashboard snapshot
+└── mcp-server/
+    └── server.ts                 # MCP server for Claude Code integration
+```
 
-To learn more about Next.js, take a look at the following resources:
+## REST API
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/dashboard` | Stats + all tickets |
+| GET | `/api/tickets` | List all tickets |
+| POST | `/api/tickets` | Create ticket |
+| GET | `/api/tickets/:id` | Get ticket |
+| PUT | `/api/tickets/:id` | Update ticket |
+| DELETE | `/api/tickets/:id` | Delete ticket |
+| GET | `/api/tickets/:id/log` | Read activity log |
+| POST | `/api/tickets/:id/log` | Append log entry |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### Create a ticket
 
-## Deploy on Vercel
+```bash
+curl -X POST http://localhost:3000/api/tickets \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Build API endpoint","priority":"high","labels":["backend","api"]}'
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+### Claim + log + complete
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+# Claim
+curl -X PUT http://localhost:3000/api/tickets/ticket-001 \
+  -H "Content-Type: application/json" \
+  -d '{"status":"in_progress","assignee":"backend-agent"}'
+
+# Log progress
+curl -X POST http://localhost:3000/api/tickets/ticket-001/log \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"backend-agent","type":"update","message":"Endpoint implemented"}'
+
+# Complete
+curl -X PUT http://localhost:3000/api/tickets/ticket-001 \
+  -H "Content-Type: application/json" \
+  -d '{"status":"done","logAgent":"backend-agent","logMessage":"Done!"}'
+```
+
+## MCP Server
+
+Run alongside the dashboard to give Claude Code native tool access:
+
+```bash
+npm run mcp
+```
+
+Add to `~/.claude/claude_code_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "taskforce-ai": {
+      "command": "npm",
+      "args": ["run", "mcp"],
+      "cwd": "/absolute/path/to/taskforce-ai"
+    }
+  }
+}
+```
+
+MCP tools available: `taskforce_get_dashboard`, `taskforce_list_tickets`, `taskforce_create_ticket`, `taskforce_claim_ticket`, `taskforce_log_progress`, `taskforce_complete_ticket`, `taskforce_update_ticket`, `taskforce_get_activity_log`, `taskforce_delete_ticket`
+
+## Kick-off Prompt for Claude Agent Teams
+
+```
+Using the TaskForce Kanban skill, coordinate a multi-agent team to: [YOUR GOAL]
+
+1. Check the board: GET http://localhost:3000/api/dashboard
+2. Create 8-12 tickets via POST /api/tickets (labels: backend, frontend, test...)
+3. Sub-agents claim tickets and log progress as they work
+4. Move tickets to done when complete
+5. The human is watching at http://localhost:3000 — update frequently!
+```
+
+## Features
+
+- Kanban board: To Do / In Progress / Done columns
+- Drag-and-drop between columns
+- Ticket detail modal with activity log viewer
+- Per-ticket markdown activity log (git-tracked)
+- Auto-refresh every 5 seconds
+- Dashboard stats (total, by status, active agents)
+- REST API for agent curl calls
+- MCP server for native Claude Code tool calls
+- All data persists as JSON + markdown files on disk

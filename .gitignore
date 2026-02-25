@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local kanban storage (only used in dev; production uses GitHub/KV)
+/taskforce_kanban/

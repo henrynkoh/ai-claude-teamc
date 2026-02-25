@@ -1,11 +1,13 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Ticket, DashboardStats } from '@/lib/types';
 import DashboardHeader from '@/components/DashboardHeader';
 import KanbanBoard from '@/components/KanbanBoard';
 import CreateTicketModal from '@/components/CreateTicketModal';
-import { Terminal, Zap, AlertTriangle } from 'lucide-react';
+import ToastContainer from '@/components/Toast';
+import { useToast } from '@/hooks/useToast';
+import { Terminal, Zap, AlertTriangle, Search, X } from 'lucide-react';
 
 const EMPTY_STATS: DashboardStats = {
   total: 0, todo: 0, in_progress: 0, done: 0, lastUpdated: '', agents: [],
@@ -18,6 +20,8 @@ export default function Home() {
   const [refreshing, setRefreshing] = useState(false);
   const [initialLoad, setInitialLoad] = useState(true);
   const [storageError, setStorageError] = useState(false);
+  const [search, setSearch] = useState('');
+  const { toasts, toast, dismiss } = useToast();
 
   const fetchDashboard = useCallback(async (showSpinner = false) => {
     if (showSpinner) setRefreshing(true);
@@ -28,7 +32,7 @@ export default function Home() {
       setStats(data.stats ?? EMPTY_STATS);
       setStorageError(!!data._storageError);
     } catch {
-      // silent — keep existing state
+      // keep existing state
     } finally {
       if (showSpinner) setRefreshing(false);
       setInitialLoad(false);
@@ -40,6 +44,34 @@ export default function Home() {
     const interval = setInterval(() => fetchDashboard(), 5000);
     return () => clearInterval(interval);
   }, [fetchDashboard]);
+
+  const filteredTickets = useMemo(() => {
+    if (!search.trim()) return tickets;
+    const q = search.toLowerCase();
+    return tickets.filter(
+      (t) =>
+        t.id.includes(q) ||
+        t.title.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        t.labels.some((l) => l.toLowerCase().includes(q)) ||
+        (t.assignee ?? '').toLowerCase().includes(q)
+    );
+  }, [tickets, search]);
+
+  const handleCreated = useCallback(() => {
+    fetchDashboard();
+    toast('Ticket created', 'success');
+  }, [fetchDashboard, toast]);
+
+  const handleUpdated = useCallback(() => {
+    fetchDashboard();
+    toast('Ticket updated', 'success');
+  }, [fetchDashboard, toast]);
+
+  const handleDeleted = useCallback(() => {
+    fetchDashboard();
+    toast('Ticket deleted', 'info');
+  }, [fetchDashboard, toast]);
 
   if (initialLoad) {
     return (
@@ -62,16 +94,39 @@ export default function Home() {
         refreshing={refreshing}
       />
 
-      {/* Redis setup banner */}
       {storageError && (
-        <div className="mx-6 mt-3 flex items-start gap-3 bg-amber-950 border border-amber-700 rounded-xl px-4 py-3 shrink-0">
+        <div className="mx-4 mt-3 flex items-start gap-3 bg-amber-950 border border-amber-700 rounded-xl px-4 py-3 shrink-0">
           <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-amber-300 leading-relaxed">
-            <span className="font-semibold">Redis not connected.</span>{' '}
-            Go to{' '}
-            <span className="font-mono text-amber-200">vercel.com → taskforce-ai → Storage</span>
-            {' '}→ Add Upstash Redis → Link to this project. Vercel will redeploy automatically.
+          <p className="text-xs text-amber-300 leading-relaxed">
+            <span className="font-semibold">Storage not connected.</span>{' '}
+            Go to <span className="font-mono text-amber-200">vercel.com → taskforce-ai → Storage</span>
+            {' '}→ Add Upstash Redis → Link to project.
+          </p>
+        </div>
+      )}
+
+      {/* Search bar */}
+      {tickets.length > 0 && (
+        <div className="px-6 pt-3 shrink-0">
+          <div className="relative max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Filter tickets by title, label, agent…"
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-8 pr-8 py-1.5 text-white text-xs placeholder-gray-600 focus:outline-none focus:border-violet-500"
+            />
+            {search && (
+              <button onClick={() => setSearch('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
+          {search && (
+            <p className="text-gray-500 text-xs mt-1">
+              {filteredTickets.length} of {tickets.length} tickets
+            </p>
+          )}
         </div>
       )}
 
@@ -91,7 +146,7 @@ export default function Home() {
             <div className="w-full bg-gray-900 border border-gray-800 rounded-xl p-4 text-left">
               <p className="text-gray-500 text-xs font-medium mb-2">Kick-off prompt for Claude:</p>
               <code className="text-green-400 text-xs leading-relaxed block">
-                {`Initialize TaskForce Kanban board and create tickets for: [your project goal]. Then have agents claim and work on them.`}
+                Initialize TaskForce Kanban and create tickets for: [your goal]. Have agents claim and work on them.
               </code>
             </div>
             {!storageError && (
@@ -106,17 +161,20 @@ export default function Home() {
         </div>
       ) : (
         <KanbanBoard
-          tickets={tickets}
-          onRefresh={() => fetchDashboard()}
+          tickets={filteredTickets}
+          onRefresh={fetchDashboard}
           onCreateClick={() => setShowCreate(true)}
+          onTicketUpdated={handleUpdated}
+          onTicketDeleted={handleDeleted}
+          onToast={toast}
         />
       )}
 
       {tickets.length > 0 && !storageError && (
         <button
           onClick={() => setShowCreate(true)}
-          className="fixed bottom-6 right-6 w-12 h-12 bg-violet-600 hover:bg-violet-500 text-white rounded-full shadow-lg shadow-violet-900/50 flex items-center justify-center transition-all hover:scale-110"
-          title="Create ticket"
+          className="fixed bottom-6 right-6 w-12 h-12 bg-violet-600 hover:bg-violet-500 text-white rounded-full shadow-lg shadow-violet-900/50 flex items-center justify-center transition-all hover:scale-110 z-40"
+          title="Create ticket (N)"
         >
           <span className="text-2xl font-light leading-none">+</span>
         </button>
@@ -125,9 +183,11 @@ export default function Home() {
       {showCreate && (
         <CreateTicketModal
           onClose={() => setShowCreate(false)}
-          onCreated={() => fetchDashboard()}
+          onCreated={handleCreated}
         />
       )}
+
+      <ToastContainer toasts={toasts} onDismiss={dismiss} />
     </div>
   );
 }

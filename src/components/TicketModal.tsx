@@ -8,6 +8,7 @@ interface Props {
   ticket: Ticket;
   onClose: () => void;
   onUpdated: () => void;
+  onDeleted?: () => void;
 }
 
 const statusOptions: { value: TicketStatus; label: string; color: string }[] = [
@@ -22,7 +23,7 @@ const priorityOptions: { value: TicketPriority; label: string }[] = [
   { value: 'low', label: 'Low' },
 ];
 
-export default function TicketModal({ ticket, onClose, onUpdated }: Props) {
+export default function TicketModal({ ticket, onClose, onUpdated, onDeleted }: Props) {
   const [activityLog, setActivityLog] = useState('');
   const [logMessage, setLogMessage] = useState('');
   const [logAgent, setLogAgent] = useState('');
@@ -87,7 +88,7 @@ export default function TicketModal({ ticket, onClose, onUpdated }: Props) {
     setDeleting(true);
     try {
       await fetch(`/api/tickets/${ticket.id}`, { method: 'DELETE' });
-      onUpdated();
+      onDeleted ? onDeleted() : onUpdated();
       onClose();
     } finally {
       setDeleting(false);

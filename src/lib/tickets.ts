@@ -1,165 +1,120 @@
 /**
- * Storage adapter: uses Vercel KV on Vercel, local filesystem in dev.
- * Switch is automatic — if KV_REST_API_URL env var is present, KV is used.
+ * Storage adapter — three backends, auto-selected by env vars:
+ *  1. GitHub API  (GITHUB_TOKEN set)          → tickets stored as JSON files in repo
+ *  2. Vercel KV   (KV_REST_API_URL set)        → Redis via @vercel/kv
+ *  3. Local fs    (dev / no env vars)          → taskforce_kanban/ folder
  */
 
 import { Ticket, TicketStatus, DashboardStats } from './types';
 
-const IS_KV = !!process.env.KV_REST_API_URL;
+const USE_GITHUB = !!process.env.GITHUB_TOKEN;
+const USE_KV     = !USE_GITHUB && !!process.env.KV_REST_API_URL;
 
-// ─── KV helpers (lazy import so build works without KV env vars) ──────────────
+const GH_OWNER  = process.env.GITHUB_OWNER  ?? 'henrynkoh';
+const GH_REPO   = process.env.GITHUB_REPO   ?? 'ai-claude-teamc';
+const GH_BRANCH = process.env.GITHUB_BRANCH ?? 'data';
 
-async function kvGet<T>(key: string): Promise<T | null> {
-  const { kv } = await import('@vercel/kv');
-  return kv.get<T>(key);
-}
-async function kvSet(key: string, value: unknown): Promise<void> {
-  const { kv } = await import('@vercel/kv');
-  await kv.set(key, value);
-}
-async function kvDel(...keys: string[]): Promise<void> {
-  const { kv } = await import('@vercel/kv');
-  await kv.del(...(keys as [string, ...string[]]));
-}
-async function kvSAdd(key: string, ...members: string[]): Promise<void> {
-  const { kv } = await import('@vercel/kv');
-  await kv.sadd(key, members[0], ...members.slice(1));
-}
-async function kvSRem(key: string, member: string): Promise<void> {
-  const { kv } = await import('@vercel/kv');
-  await kv.srem(key, member);
-}
-async function kvSMembers(key: string): Promise<string[]> {
-  const { kv } = await import('@vercel/kv');
-  const result = await kv.smembers(key);
-  return result.map(String);
+// ─── GitHub storage ──────────────────────────────────────────────────────────
+
+async function ghApi(path: string, opts: RequestInit = {}) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(opts.headers ?? {}),
+    },
+  });
+  if (res.status === 404) return null;
+  return res.json();
 }
 
-// ─── KV storage ──────────────────────────────────────────────────────────────
-
-async function kvGetAllTickets(): Promise<Ticket[]> {
-  const ids = await kvSMembers('ticket-ids');
-  if (!ids.length) return [];
-  const tickets = await Promise.all(ids.map((id) => kvGet<Ticket>(`ticket:${id}`)));
-  return (tickets.filter(Boolean) as Ticket[]).sort((a, b) => a.id.localeCompare(b.id));
+async function ghGetFile(path: string): Promise<{ content: string; sha: string } | null> {
+  const data = await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/contents/${path}?ref=${GH_BRANCH}`);
+  if (!data || data.type !== 'file') return null;
+  return { content: Buffer.from(data.content, 'base64').toString('utf-8'), sha: data.sha };
 }
 
-async function kvGetTicketById(id: string): Promise<Ticket | null> {
-  return kvGet<Ticket>(`ticket:${id}`);
-}
-
-async function kvCreateTicket(
-  data: Omit<Ticket, 'id' | 'created_at' | 'updated_at' | 'activity_log_file'>
-): Promise<Ticket> {
-  const ids = await kvSMembers('ticket-ids');
-  const maxNum = ids.reduce((max, id) => {
-    const n = parseInt(String(id).replace('ticket-', ''), 10);
-    return isNaN(n) ? max : Math.max(max, n);
-  }, 0);
-  const id = `ticket-${String(maxNum + 1).padStart(3, '0')}`;
-  const now = new Date().toISOString();
-  const ticket: Ticket = {
-    ...data,
-    id,
-    status: 'todo',
-    created_at: now,
-    updated_at: now,
-    activity_log_file: `activity-${id}.md`,
-  };
-  await kvSet(`ticket:${id}`, ticket);
-  await kvSAdd('ticket-ids', id);
-  await kvAppendActivityLog(id, 'Lead', 'created', `Ticket registered: ${ticket.title}`);
-  return ticket;
-}
-
-async function kvUpdateTicket(id: string, updates: Partial<Ticket>): Promise<Ticket | null> {
-  const ticket = await kvGetTicketById(id);
-  if (!ticket) return null;
-  const updated = { ...ticket, ...updates, id, updated_at: new Date().toISOString() };
-  await kvSet(`ticket:${id}`, updated);
-  return updated;
-}
-
-async function kvDeleteTicket(id: string): Promise<boolean> {
-  const ticket = await kvGetTicketById(id);
-  if (!ticket) return false;
-  await kvDel(`ticket:${id}`, `log:${id}`);
-  await kvSRem('ticket-ids', id);
-  return true;
-}
-
-async function kvGetActivityLog(id: string): Promise<string> {
-  return (await kvGet<string>(`log:${id}`)) ?? '';
-}
-
-async function kvAppendActivityLog(
-  id: string,
-  agent: string,
-  type: string,
-  message: string,
-  details?: string
-): Promise<void> {
-  const existing = (await kvGet<string>(`log:${id}`)) ?? '';
-  const entry = buildLogEntry(type, agent, message, details);
-  await kvSet(`log:${id}`, existing + entry);
-}
-
-// ─── Filesystem storage (local dev) ──────────────────────────────────────────
-
-import fs from 'fs';
-import path from 'path';
-
-const KANBAN_ROOT = path.join(process.cwd(), 'taskforce_kanban');
-const FOLDERS: Record<TicketStatus, string> = {
-  todo: path.join(KANBAN_ROOT, 'todo'),
-  in_progress: path.join(KANBAN_ROOT, 'in_progress'),
-  done: path.join(KANBAN_ROOT, 'done'),
-};
-const LOGS_DIR = path.join(KANBAN_ROOT, 'logs');
-
-function ensureDirs() {
-  [KANBAN_ROOT, ...Object.values(FOLDERS), LOGS_DIR].forEach((dir) => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+async function ghPutFile(path: string, content: string, message: string, sha?: string) {
+  await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/contents/${path}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      message,
+      content: Buffer.from(content).toString('base64'),
+      branch: GH_BRANCH,
+      ...(sha ? { sha } : {}),
+    }),
   });
 }
 
-function fsGetAllTickets(): Ticket[] {
-  ensureDirs();
-  const tickets: Ticket[] = [];
-  for (const [status, folder] of Object.entries(FOLDERS)) {
-    if (!fs.existsSync(folder)) continue;
-    for (const file of fs.readdirSync(folder).filter((f) => f.endsWith('.json'))) {
-      try {
-        const ticket = JSON.parse(fs.readFileSync(path.join(folder, file), 'utf-8')) as Ticket;
-        ticket.status = status as TicketStatus;
-        tickets.push(ticket);
-      } catch { /* skip */ }
-    }
-  }
-  return tickets.sort((a, b) => a.id.localeCompare(b.id));
+async function ghDeleteFile(path: string, message: string, sha: string) {
+  await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/contents/${path}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ message, branch: GH_BRANCH, sha }),
+  });
 }
 
-function fsGetTicketById(id: string): Ticket | null {
-  ensureDirs();
-  for (const [status, folder] of Object.entries(FOLDERS)) {
-    const fp = path.join(folder, `${id}.json`);
-    if (fs.existsSync(fp)) {
-      const ticket = JSON.parse(fs.readFileSync(fp, 'utf-8')) as Ticket;
-      ticket.status = status as TicketStatus;
-      return ticket;
+async function ghListDir(dir: string): Promise<Array<{ name: string; sha: string }>> {
+  const data = await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/contents/${dir}?ref=${GH_BRANCH}`);
+  if (!Array.isArray(data)) return [];
+  return data.filter((f: { type: string }) => f.type === 'file');
+}
+
+async function ensureDataBranch() {
+  // Create 'data' branch if it doesn't exist
+  const branch = await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/branches/${GH_BRANCH}`);
+  if (!branch) {
+    const main = await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/branches/main`);
+    await ghApi(`/repos/${GH_OWNER}/${GH_REPO}/git/refs`, {
+      method: 'POST',
+      body: JSON.stringify({ ref: `refs/heads/${GH_BRANCH}`, sha: main.commit.sha }),
+    });
+  }
+}
+
+async function ghGetAllTickets(): Promise<Ticket[]> {
+  await ensureDataBranch();
+  const statuses: TicketStatus[] = ['todo', 'in_progress', 'done'];
+  const all: Ticket[] = [];
+  for (const status of statuses) {
+    const files = await ghListDir(`tickets/${status}`);
+    for (const f of files) {
+      if (!f.name.endsWith('.json')) continue;
+      const file = await ghGetFile(`tickets/${status}/${f.name}`);
+      if (file) {
+        try {
+          const t = JSON.parse(file.content) as Ticket;
+          t.status = status;
+          all.push(t);
+        } catch { /* skip */ }
+      }
+    }
+  }
+  return all.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function ghGetTicketById(id: string): Promise<{ ticket: Ticket; sha: string; status: TicketStatus } | null> {
+  for (const status of ['todo', 'in_progress', 'done'] as TicketStatus[]) {
+    const file = await ghGetFile(`tickets/${status}/${id}.json`);
+    if (file) {
+      const ticket = JSON.parse(file.content) as Ticket;
+      ticket.status = status;
+      return { ticket, sha: file.sha, status };
     }
   }
   return null;
 }
 
-function fsCreateTicket(
+async function ghCreateTicket(
   data: Omit<Ticket, 'id' | 'created_at' | 'updated_at' | 'activity_log_file'>
-): Ticket {
-  ensureDirs();
-  const existing = fsGetAllTickets();
-  const maxNum = existing.reduce((max, t) => {
+): Promise<Ticket> {
+  await ensureDataBranch();
+  const existing = await ghGetAllTickets();
+  const maxNum = existing.reduce((m, t) => {
     const n = parseInt(t.id.replace('ticket-', ''), 10);
-    return isNaN(n) ? max : Math.max(max, n);
+    return isNaN(n) ? m : Math.max(m, n);
   }, 0);
   const id = `ticket-${String(maxNum + 1).padStart(3, '0')}`;
   const now = new Date().toISOString();
@@ -167,123 +122,249 @@ function fsCreateTicket(
     ...data, id, status: 'todo', created_at: now, updated_at: now,
     activity_log_file: `activity-${id}.md`,
   };
-  fs.writeFileSync(path.join(FOLDERS.todo, `${id}.json`), JSON.stringify(ticket, null, 2));
-  fsAppendActivityLog(id, 'Lead', 'created', `Ticket registered: ${ticket.title}`);
-  fsRefreshDashboard();
+  await ghPutFile(`tickets/todo/${id}.json`, JSON.stringify(ticket, null, 2), `create ${id}`);
+  await ghAppendLog(id, 'Lead', 'created', `Ticket registered: ${ticket.title}`);
   return ticket;
 }
 
-function fsUpdateTicket(id: string, updates: Partial<Ticket>): Ticket | null {
-  ensureDirs();
-  const ticket = fsGetTicketById(id);
-  if (!ticket) return null;
-  const newStatus = updates.status ?? ticket.status;
-  const updated = { ...ticket, ...updates, id, updated_at: new Date().toISOString(), status: newStatus };
-  const oldPath = path.join(FOLDERS[ticket.status], `${id}.json`);
-  if (newStatus !== ticket.status && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-  fs.writeFileSync(path.join(FOLDERS[newStatus], `${id}.json`), JSON.stringify(updated, null, 2));
-  fsRefreshDashboard();
+async function ghUpdateTicket(id: string, updates: Partial<Ticket>): Promise<Ticket | null> {
+  const result = await ghGetTicketById(id);
+  if (!result) return null;
+  const newStatus = updates.status ?? result.ticket.status;
+  const updated: Ticket = { ...result.ticket, ...updates, id, updated_at: new Date().toISOString(), status: newStatus };
+  if (newStatus !== result.status) {
+    await ghDeleteFile(`tickets/${result.status}/${id}.json`, `move ${id} to ${newStatus}`, result.sha);
+    await ghPutFile(`tickets/${newStatus}/${id}.json`, JSON.stringify(updated, null, 2), `update ${id}`);
+  } else {
+    await ghPutFile(`tickets/${result.status}/${id}.json`, JSON.stringify(updated, null, 2), `update ${id}`, result.sha);
+  }
   return updated;
 }
 
-function fsDeleteTicket(id: string): boolean {
-  const ticket = fsGetTicketById(id);
-  if (!ticket) return false;
-  const fp = path.join(FOLDERS[ticket.status], `${id}.json`);
-  if (fs.existsSync(fp)) fs.unlinkSync(fp);
-  const lp = path.join(LOGS_DIR, `activity-${id}.md`);
-  if (fs.existsSync(lp)) fs.unlinkSync(lp);
-  fsRefreshDashboard();
+async function ghDeleteTicket(id: string): Promise<boolean> {
+  const result = await ghGetTicketById(id);
+  if (!result) return false;
+  await ghDeleteFile(`tickets/${result.status}/${id}.json`, `delete ${id}`, result.sha);
+  const log = await ghGetFile(`logs/activity-${id}.md`);
+  if (log) await ghDeleteFile(`logs/activity-${id}.md`, `delete log ${id}`, log.sha);
   return true;
 }
 
-function fsGetActivityLog(id: string): string {
-  ensureDirs();
-  const lp = path.join(LOGS_DIR, `activity-${id}.md`);
-  return fs.existsSync(lp) ? fs.readFileSync(lp, 'utf-8') : '';
+async function ghGetLog(id: string): Promise<string> {
+  const file = await ghGetFile(`logs/activity-${id}.md`);
+  return file?.content ?? '';
 }
 
-function fsAppendActivityLog(id: string, agent: string, type: string, message: string, details?: string) {
-  ensureDirs();
-  fs.appendFileSync(path.join(LOGS_DIR, `activity-${id}.md`), buildLogEntry(type, agent, message, details));
+async function ghAppendLog(id: string, agent: string, type: string, message: string, details?: string) {
+  const existing = await ghGetFile(`logs/activity-${id}.md`);
+  const entry = buildLogEntry(type, agent, message, details);
+  const content = (existing?.content ?? '') + entry;
+  await ghPutFile(`logs/activity-${id}.md`, content, `log ${id}`, existing?.sha);
 }
 
-function fsRefreshDashboard() {
-  const tickets = fsGetAllTickets();
-  const todo = tickets.filter(t => t.status === 'todo');
-  const inProg = tickets.filter(t => t.status === 'in_progress');
-  const done = tickets.filter(t => t.status === 'done');
-  const fmt = (t: Ticket) => `- **${t.id}**: ${t.title} [${t.priority}]${t.assignee ? ` → ${t.assignee}` : ''}`;
-  const content = [
-    '# TaskForce Kanban Dashboard',
-    `Last updated: ${new Date().toISOString()}`,
-    `Total: ${tickets.length} | Todo: ${todo.length} | In Progress: ${inProg.length} | Done: ${done.length}`,
-    '', `## To Do (${todo.length})`, todo.length ? todo.map(fmt).join('\n') : '_No tickets_',
-    '', `## In Progress (${inProg.length})`, inProg.length ? inProg.map(fmt).join('\n') : '_No tickets_',
-    '', `## Done (${done.length})`, done.length ? done.map(fmt).join('\n') : '_No tickets_',
+// ─── KV storage (Vercel KV / Upstash) ────────────────────────────────────────
+
+async function kvGet<T>(key: string): Promise<T | null> {
+  const { kv } = await import('@vercel/kv');
+  return kv.get<T>(key);
+}
+async function kvSet(key: string, value: unknown) {
+  const { kv } = await import('@vercel/kv');
+  await kv.set(key, value);
+}
+async function kvDel(...keys: string[]) {
+  const { kv } = await import('@vercel/kv');
+  await kv.del(...(keys as [string, ...string[]]));
+}
+async function kvSAdd(key: string, member: string) {
+  const { kv } = await import('@vercel/kv');
+  await kv.sadd(key, member);
+}
+async function kvSRem(key: string, member: string) {
+  const { kv } = await import('@vercel/kv');
+  await kv.srem(key, member);
+}
+async function kvSMembers(key: string): Promise<string[]> {
+  const { kv } = await import('@vercel/kv');
+  return (await kv.smembers(key)).map(String);
+}
+
+async function kvGetAll(): Promise<Ticket[]> {
+  const ids = await kvSMembers('ticket-ids');
+  if (!ids.length) return [];
+  const tickets = await Promise.all(ids.map(id => kvGet<Ticket>(`ticket:${id}`)));
+  return (tickets.filter(Boolean) as Ticket[]).sort((a, b) => a.id.localeCompare(b.id));
+}
+async function kvGetById(id: string) { return kvGet<Ticket>(`ticket:${id}`); }
+async function kvCreate(data: Omit<Ticket, 'id'|'created_at'|'updated_at'|'activity_log_file'>): Promise<Ticket> {
+  const ids = await kvSMembers('ticket-ids');
+  const max = ids.reduce((m, id) => Math.max(m, parseInt(String(id).replace('ticket-',''),10)||0), 0);
+  const id = `ticket-${String(max+1).padStart(3,'0')}`;
+  const now = new Date().toISOString();
+  const ticket: Ticket = { ...data, id, status:'todo', created_at:now, updated_at:now, activity_log_file:`activity-${id}.md` };
+  await kvSet(`ticket:${id}`, ticket);
+  await kvSAdd('ticket-ids', id);
+  await kvAppend(id,'Lead','created',`Ticket registered: ${ticket.title}`);
+  return ticket;
+}
+async function kvUpdate(id: string, updates: Partial<Ticket>): Promise<Ticket|null> {
+  const t = await kvGetById(id); if (!t) return null;
+  const updated = { ...t, ...updates, id, updated_at: new Date().toISOString() };
+  await kvSet(`ticket:${id}`, updated); return updated;
+}
+async function kvDelete(id: string): Promise<boolean> {
+  const t = await kvGetById(id); if (!t) return false;
+  await kvDel(`ticket:${id}`, `log:${id}`); await kvSRem('ticket-ids', id); return true;
+}
+async function kvGetLog(id: string): Promise<string> { return (await kvGet<string>(`log:${id}`)) ?? ''; }
+async function kvAppend(id: string, agent: string, type: string, message: string, details?: string) {
+  const existing = (await kvGet<string>(`log:${id}`)) ?? '';
+  await kvSet(`log:${id}`, existing + buildLogEntry(type, agent, message, details));
+}
+
+// ─── Local filesystem storage (dev) ──────────────────────────────────────────
+
+import fs from 'fs';
+import path from 'path';
+
+const ROOT = path.join(process.cwd(), 'taskforce_kanban');
+const DIRS: Record<TicketStatus, string> = {
+  todo: path.join(ROOT,'todo'), in_progress: path.join(ROOT,'in_progress'), done: path.join(ROOT,'done'),
+};
+const LOGS = path.join(ROOT,'logs');
+
+function mkdirs() {
+  [ROOT,...Object.values(DIRS),LOGS].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d,{recursive:true}); });
+}
+function fsGetAll(): Ticket[] {
+  mkdirs();
+  const out: Ticket[] = [];
+  for (const [status, dir] of Object.entries(DIRS)) {
+    for (const f of fs.readdirSync(dir).filter(f=>f.endsWith('.json'))) {
+      try { const t = JSON.parse(fs.readFileSync(path.join(dir,f),'utf-8')) as Ticket; t.status=status as TicketStatus; out.push(t); } catch{}
+    }
+  }
+  return out.sort((a,b)=>a.id.localeCompare(b.id));
+}
+function fsGetById(id: string): Ticket|null {
+  mkdirs();
+  for (const [status,dir] of Object.entries(DIRS)) {
+    const fp = path.join(dir,`${id}.json`);
+    if (fs.existsSync(fp)) { const t=JSON.parse(fs.readFileSync(fp,'utf-8')) as Ticket; t.status=status as TicketStatus; return t; }
+  }
+  return null;
+}
+function fsCreate(data: Omit<Ticket,'id'|'created_at'|'updated_at'|'activity_log_file'>): Ticket {
+  mkdirs();
+  const max = fsGetAll().reduce((m,t)=>Math.max(m,parseInt(t.id.replace('ticket-',''),10)||0),0);
+  const id=`ticket-${String(max+1).padStart(3,'0')}`, now=new Date().toISOString();
+  const ticket: Ticket = {...data,id,status:'todo',created_at:now,updated_at:now,activity_log_file:`activity-${id}.md`};
+  fs.writeFileSync(path.join(DIRS.todo,`${id}.json`),JSON.stringify(ticket,null,2));
+  fsAppend(id,'Lead','created',`Ticket registered: ${ticket.title}`);
+  fsRefresh(); return ticket;
+}
+function fsUpdate(id: string, updates: Partial<Ticket>): Ticket|null {
+  mkdirs();
+  const t=fsGetById(id); if (!t) return null;
+  const ns=(updates.status??t.status) as TicketStatus;
+  const updated={...t,...updates,id,updated_at:new Date().toISOString(),status:ns};
+  const old=path.join(DIRS[t.status],`${id}.json`);
+  if (ns!==t.status && fs.existsSync(old)) fs.unlinkSync(old);
+  fs.writeFileSync(path.join(DIRS[ns],`${id}.json`),JSON.stringify(updated,null,2));
+  fsRefresh(); return updated;
+}
+function fsDelete(id: string): boolean {
+  const t=fsGetById(id); if (!t) return false;
+  const fp=path.join(DIRS[t.status],`${id}.json`); if(fs.existsSync(fp)) fs.unlinkSync(fp);
+  const lp=path.join(LOGS,`activity-${id}.md`); if(fs.existsSync(lp)) fs.unlinkSync(lp);
+  fsRefresh(); return true;
+}
+function fsGetLog(id: string): string {
+  mkdirs(); const lp=path.join(LOGS,`activity-${id}.md`); return fs.existsSync(lp)?fs.readFileSync(lp,'utf-8'):'';
+}
+function fsAppend(id: string, agent: string, type: string, message: string, details?: string) {
+  mkdirs(); fs.appendFileSync(path.join(LOGS,`activity-${id}.md`), buildLogEntry(type,agent,message,details));
+}
+function fsRefresh() {
+  const tickets=fsGetAll();
+  const fmt=(t:Ticket)=>`- **${t.id}**: ${t.title} [${t.priority}]${t.assignee?` → ${t.assignee}`:''}`;
+  const todo=tickets.filter(t=>t.status==='todo'), ip=tickets.filter(t=>t.status==='in_progress'), done=tickets.filter(t=>t.status==='done');
+  const md=[
+    '# TaskForce Kanban Dashboard',`Last updated: ${new Date().toISOString()}`,
+    `Total: ${tickets.length} | Todo: ${todo.length} | In Progress: ${ip.length} | Done: ${done.length}`,
+    '',`## To Do (${todo.length})`,todo.length?todo.map(fmt).join('\n'):'_No tickets_',
+    '',`## In Progress (${ip.length})`,ip.length?ip.map(fmt).join('\n'):'_No tickets_',
+    '',`## Done (${done.length})`,done.length?done.map(fmt).join('\n'):'_No tickets_',
   ].join('\n');
-  fs.writeFileSync(path.join(KANBAN_ROOT, 'taskforce_dashboard.md'), content);
+  fs.writeFileSync(path.join(ROOT,'taskforce_dashboard.md'),md);
 }
 
 // ─── Shared ───────────────────────────────────────────────────────────────────
 
 function buildLogEntry(type: string, agent: string, message: string, details?: string): string {
-  const emoji: Record<string, string> = {
-    created: '🟢', claimed: '🔵', update: '🟡', blocked: '🔴', completed: '✅', note: '📝',
-  };
-  return [
-    `## ${emoji[type] ?? '📝'} ${type.toUpperCase()} — ${new Date().toISOString()}`,
-    `**Agent:** ${agent}`,
-    `**Message:** ${message}`,
-    details ? `**Details:**\n${details}` : '',
-    '---', '',
-  ].filter(Boolean).join('\n') + '\n';
+  const emoji: Record<string,string> = {created:'🟢',claimed:'🔵',update:'🟡',blocked:'🔴',completed:'✅',note:'📝'};
+  return [`## ${emoji[type]??'📝'} ${type.toUpperCase()} — ${new Date().toISOString()}`,
+    `**Agent:** ${agent}`,`**Message:** ${message}`,
+    details?`**Details:**\n${details}`:'','---','',
+  ].filter(Boolean).join('\n')+'\n';
 }
 
-// ─── Public API (async, works with both backends) ────────────────────────────
+// ─── Public async API ─────────────────────────────────────────────────────────
 
 export async function getAllTickets(): Promise<Ticket[]> {
-  return IS_KV ? kvGetAllTickets() : fsGetAllTickets();
+  if (USE_GITHUB) return ghGetAllTickets();
+  if (USE_KV)     return kvGetAll();
+  return fsGetAll();
 }
 
 export async function getTicketById(id: string): Promise<Ticket | null> {
-  return IS_KV ? kvGetTicketById(id) : fsGetTicketById(id);
+  if (USE_GITHUB) return (await ghGetTicketById(id))?.ticket ?? null;
+  if (USE_KV)     return kvGetById(id);
+  return fsGetById(id);
 }
 
 export async function createTicket(
-  data: Omit<Ticket, 'id' | 'created_at' | 'updated_at' | 'activity_log_file'>
+  data: Omit<Ticket, 'id'|'created_at'|'updated_at'|'activity_log_file'>
 ): Promise<Ticket> {
-  return IS_KV ? kvCreateTicket(data) : fsCreateTicket(data);
+  if (USE_GITHUB) return ghCreateTicket(data);
+  if (USE_KV)     return kvCreate(data);
+  return fsCreate(data);
 }
 
 export async function updateTicket(id: string, updates: Partial<Ticket>): Promise<Ticket | null> {
-  return IS_KV ? kvUpdateTicket(id, updates) : fsUpdateTicket(id, updates);
+  if (USE_GITHUB) return ghUpdateTicket(id, updates);
+  if (USE_KV)     return kvUpdate(id, updates);
+  return fsUpdate(id, updates);
 }
 
 export async function deleteTicket(id: string): Promise<boolean> {
-  return IS_KV ? kvDeleteTicket(id) : fsDeleteTicket(id);
+  if (USE_GITHUB) return ghDeleteTicket(id);
+  if (USE_KV)     return kvDelete(id);
+  return fsDelete(id);
 }
 
 export async function getActivityLog(id: string): Promise<string> {
-  return IS_KV ? kvGetActivityLog(id) : fsGetActivityLog(id);
+  if (USE_GITHUB) return ghGetLog(id);
+  if (USE_KV)     return kvGetLog(id);
+  return fsGetLog(id);
 }
 
 export async function appendActivityLog(
   id: string, agent: string, type: string, message: string, details?: string
 ): Promise<void> {
-  return IS_KV
-    ? kvAppendActivityLog(id, agent, type, message, details)
-    : fsAppendActivityLog(id, agent, type, message, details);
+  if (USE_GITHUB) return ghAppendLog(id, agent, type, message, details);
+  if (USE_KV)     return kvAppend(id, agent, type, message, details);
+  fsAppend(id, agent, type, message, details);
 }
 
 export async function getDashboardStats(): Promise<DashboardStats> {
   const tickets = await getAllTickets();
-  const agents = [...new Set(tickets.map(t => t.assignee).filter(Boolean))] as string[];
+  const agents = [...new Set(tickets.map(t=>t.assignee).filter(Boolean))] as string[];
   return {
     total: tickets.length,
-    todo: tickets.filter(t => t.status === 'todo').length,
-    in_progress: tickets.filter(t => t.status === 'in_progress').length,
-    done: tickets.filter(t => t.status === 'done').length,
+    todo: tickets.filter(t=>t.status==='todo').length,
+    in_progress: tickets.filter(t=>t.status==='in_progress').length,
+    done: tickets.filter(t=>t.status==='done').length,
     lastUpdated: new Date().toISOString(),
     agents,
   };

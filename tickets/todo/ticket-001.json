@@ -1,0 +1,20 @@
+{
+  "title": "EA-SEE-part2",
+  "description": "EA-SEE-part2 exam test sets",
+  "priority": "medium",
+  "labels": [
+    "backend",
+    "api",
+    "fastapi"
+  ],
+  "dependencies": [
+    "ticket-001",
+    "ticket-002"
+  ],
+  "assignee": "backend-agent",
+  "status": "todo",
+  "id": "ticket-001",
+  "created_at": "2026-02-26T15:52:12.435Z",
+  "updated_at": "2026-02-26T15:52:12.435Z",
+  "activity_log_file": "activity-ticket-001.md"
+}

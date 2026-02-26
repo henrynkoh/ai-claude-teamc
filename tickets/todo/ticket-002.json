@@ -1,0 +1,20 @@
+{
+  "title": "Build fastAPI for backend endpoint",
+  "description": "Build fastAPI for backend endpoint",
+  "priority": "medium",
+  "labels": [
+    "frontend",
+    "api",
+    "fastapi"
+  ],
+  "dependencies": [
+    "ticket-003",
+    "ticket-004"
+  ],
+  "assignee": "frontend agent",
+  "status": "todo",
+  "id": "ticket-002",
+  "created_at": "2026-02-26T15:55:24.738Z",
+  "updated_at": "2026-02-26T15:55:24.738Z",
+  "activity_log_file": "activity-ticket-002.md"
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Hello",
+  "description": "Busy",
+  "priority": "medium",
+  "labels": [],
+  "dependencies": [],
+  "assignee": null,
+  "status": "todo",
+  "id": "ticket-002",
+  "created_at": "2026-05-20T10:41:47.193Z",
+  "updated_at": "2026-05-20T10:41:47.193Z",
+  "activity_log_file": "activity-ticket-002.md"
+}
